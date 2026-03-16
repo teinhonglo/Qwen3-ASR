@@ -163,30 +163,21 @@ class CastFloatInputsTrainer(Trainer):
                     inputs[k] = v.to(dtype=model_dtype)
         return inputs
 
-
-def copy_required_hf_files_for_qwen_asr(src_dir: str, dst_dir: str):
-    os.makedirs(dst_dir, exist_ok=True)
-    required = [
-        "config.json",
-        "generation_config.json",
-        "preprocessor_config.json",
-        "processor_config.json",
-        "tokenizer_config.json",
-        "tokenizer.json",
-        "special_tokens_map.json",
-        "chat_template.json",
-        "merges.txt",
-        "vocab.json",
-    ]
-    for fn in required:
-        src = os.path.join(src_dir, fn)
-        if os.path.exists(src):
-            shutil.copy2(src, os.path.join(dst_dir, fn))
-
-
 class MakeEveryCheckpointInferableCallback(TrainerCallback):
-    def __init__(self, base_model_path: str):
-        self.base_model_path = base_model_path
+    def __init__(self, processor, model=None):
+        self.processor = processor
+        self.model = model
+
+    def _save_infer_files(self, save_dir: str):
+        os.makedirs(save_dir, exist_ok=True)
+
+        self.processor.save_pretrained(save_dir)
+
+        if hasattr(self.processor, "tokenizer") and self.processor.tokenizer is not None:
+            self.processor.tokenizer.save_pretrained(save_dir)
+
+        if self.model is not None and getattr(self.model, "generation_config", None) is not None:
+            self.model.generation_config.save_pretrained(save_dir)
 
     def on_save(self, args: TrainingArguments, state, control, **kwargs):
         if args.process_index != 0:
@@ -196,7 +187,7 @@ class MakeEveryCheckpointInferableCallback(TrainerCallback):
         if not os.path.isdir(ckpt_dir):
             ckpt_dir = kwargs.get("checkpoint", ckpt_dir)
 
-        copy_required_hf_files_for_qwen_asr(self.base_model_path, ckpt_dir)
+        self._save_infer_files(ckpt_dir)
         return control
 
 
@@ -308,8 +299,17 @@ def main():
         eval_dataset=ds.get("validation", None),
         data_collator=collator,
         tokenizer=processor.tokenizer,
-        callbacks=[MakeEveryCheckpointInferableCallback(base_model_path=args_cli.model_path)],
+        callbacks=[MakeEveryCheckpointInferableCallback(processor=processor, model=model)],
     )
+
+    os.makedirs(training_args.output_dir, exist_ok=True)
+    processor.save_pretrained(training_args.output_dir)
+
+    if hasattr(processor, "tokenizer") and processor.tokenizer is not None:
+        processor.tokenizer.save_pretrained(training_args.output_dir)
+
+    if getattr(model, "generation_config", None) is not None:
+        model.generation_config.save_pretrained(training_args.output_dir)
 
     resume_from = (args_cli.resume_from or "").strip()
     if not resume_from and args_cli.resume == 1:
