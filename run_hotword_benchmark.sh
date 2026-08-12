@@ -53,9 +53,27 @@ fi
 
 no_hotword_dir=$output_root/no_hotwords
 hotword_dir=$output_root/global_hotwords
+benchmark_hotwords=$benchmark_dir/all_hotwords.json
+benchmark_evaluator=$benchmark_dir/evaluate.py
+expected_evaluator_sha256=1cc5b6d9a69562e69db2866c8f9c4222852681e752f0183a10b6861b17bd7fb8
+
+if [ ! -f "$benchmark_evaluator" ]; then
+    echo "Uploaded benchmark evaluator not found: $benchmark_evaluator" >&2
+    exit 1
+fi
+
+actual_evaluator_sha256=$(sha256sum "$benchmark_evaluator" | awk '{print $1}')
+if [ "$actual_evaluator_sha256" != "$expected_evaluator_sha256" ]; then
+    echo "Evaluator checksum mismatch: $benchmark_evaluator is not the evaluate.py from the uploaded ZIP" >&2
+    echo "Expected: $expected_evaluator_sha256" >&2
+    echo "Actual:   $actual_evaluator_sha256" >&2
+    exit 1
+fi
 
 common_args=(
     --benchmark_dir "$benchmark_dir"
+    --hotwords_file "$benchmark_hotwords"
+    --evaluation_script "$benchmark_evaluator"
     --model_path "$model_path"
     --language "$language"
     --device "$device"
@@ -96,18 +114,12 @@ fi
 
 if [ "$stage" -le 3 ] && [ "$stop_stage" -ge 3 ]; then
     echo "Stage 3: evaluate inference without hotwords"
-    python local/run_hotword_benchmark.py \
-        "${common_args[@]}" \
-        --context_mode none \
-        --output_dir "$no_hotword_dir" \
-        --stage 2 \
-        --stop_stage 2
+    python "$benchmark_evaluator" \
+        --candidate "$no_hotword_dir/candidate" \
+        --output "$no_hotword_dir/report.xlsx"
 
     echo "Stage 3: evaluate inference with global hotwords"
-    python local/run_hotword_benchmark.py \
-        "${common_args[@]}" \
-        --context_mode global \
-        --output_dir "$hotword_dir" \
-        --stage 2 \
-        --stop_stage 2
+    python "$benchmark_evaluator" \
+        --candidate "$hotword_dir/candidate" \
+        --output "$hotword_dir/report.xlsx"
 fi
