@@ -3,14 +3,16 @@
 
 The benchmark keeps two different hotword files:
 
-* ``all_hotwords.json`` is the global candidate list supplied to every audio.
+* ``all_hotwords.json`` is the global candidate list supplied verbatim to every
+  audio in the hotword condition.
 * ``hotwords.json`` contains per-audio ground truth and is used only to obtain the
   expected audio IDs. The benchmark's ``evaluate.py`` reads it for scoring.
 
 In global-hotword mode, using the same list for every recording avoids leaking
 each recording's exact target words during inference. Candidate transcripts are
-written in the layout expected by the benchmark:
-``<output_dir>/candidate/<audio_id>/transcription.json``.
+written in the layout and segment schema expected by the benchmark:
+``<output_dir>/candidate/<audio_id>/transcription.json`` contains
+``[{"text": "..."}]``.
 
 The runner also records real-time factor (RTF), peak GPU memory, and peak process
 resident memory in ``inference_metrics.json``. An optional explicit hotword
@@ -279,11 +281,10 @@ def validate_benchmark(
             "hotwords.json. "
             f"Missing globally: {sorted(ground_truth_union - set(normalized))}; "
             f"extra globally: {sorted(set(normalized) - ground_truth_union)}. "
-            "The runner will use the hotwords.json union so inference and "
-            "evaluation remain consistent.",
+            "Inference will still use all_hotwords.json verbatim; evaluate.py "
+            "will score against hotwords.json as defined by the benchmark.",
             file=sys.stderr,
         )
-        normalized = sorted(ground_truth_union, key=lambda word: (word.casefold(), word))
 
     global_folded_groups = {}
     for word in normalized:
@@ -530,7 +531,7 @@ def run_inference(
         "context_mode": args.context_mode,
         "context_hotword_count": context_hotword_count,
         "context_hotwords_source": (
-            "validated union of hotwords.json"
+            "all_hotwords.json (exact file contents)"
             if args.context_mode == "global"
             else "none"
         ),
@@ -577,7 +578,12 @@ def run_inference(
                 f"Expected one transcription for audio {audio_id}, got {len(results)}"
             )
 
-        write_json_atomic(transcription_path, {"text": results[0].text or ""})
+        # Match the uploaded evaluate.py contract: a list of ASR segments, each
+        # containing a string-valued ``text`` field.
+        write_json_atomic(
+            transcription_path,
+            [{"text": results[0].text or ""}],
+        )
         per_audio_metrics[audio_id] = {
             "audio_seconds": round(audio_seconds, 6),
             "inference_seconds": round(inference_seconds, 6),
@@ -619,6 +625,26 @@ def validate_candidates(candidate_dir: Path, audio_ids: list[str]) -> None:
             f"for {len(missing)} audio IDs: {', '.join(missing)}"
         )
 
+    for audio_id in audio_ids:
+        transcription_path = candidate_dir / audio_id / "transcription.json"
+        data = read_json(transcription_path)
+        if isinstance(data, dict):
+            valid = isinstance(data.get("text"), str)
+        elif isinstance(data, list):
+            valid = all(
+                isinstance(segment, dict)
+                and isinstance(segment.get("text"), str)
+                for segment in data
+            )
+        else:
+            valid = False
+        if not valid:
+            raise ValueError(
+                f"{transcription_path} is incompatible with the uploaded "
+                "evaluate.py. Expected {\"text\": \"...\"} or "
+                "[{\"text\": \"...\"}, ...]."
+            )
+
 
 def run_evaluation(
     evaluation_script: Path,
@@ -646,6 +672,7 @@ def run_evaluation(
         "prompting, so treat MER as an auxiliary comparison only."
     )
     print("[stage 2] Running benchmark evaluator:")
+    print(f"[stage 2] Evaluator SHA-256: {file_sha256(evaluation_script)}")
     print(" ".join(command))
     subprocess.run(command, check=True)
 
