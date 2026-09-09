@@ -16,7 +16,7 @@ import re
 import sys
 from collections import Counter
 from pathlib import Path
-from typing import Dict, Iterable, List, Sequence
+from typing import Dict, Iterable, List, Optional, Sequence
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -72,6 +72,11 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Deprecated alias for --eval_bias_sizes.",
     )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Reuse a non-empty JSONL only when its row count is complete.",
+    )
     parser.add_argument("--language", type=str, default="English")
     parser.add_argument("--seed", type=int, default=66)
     return parser.parse_args()
@@ -89,14 +94,14 @@ def transcript_words(text: str) -> List[str]:
     return normalize_reward_text(text, keep_bias_markers=False).split()
 
 
-def find_audio(transcript_path: Path, utterance_id: str) -> Path:
-    for suffix in (".flac", ".wav"):
-        candidate = transcript_path.parent / f"{utterance_id}{suffix}"
-        if candidate.is_file():
-            return candidate.resolve()
-    raise FileNotFoundError(
-        f"No .flac or .wav found for {utterance_id} next to {transcript_path}"
-    )
+def index_audio_files(transcript_path: Path) -> Dict[str, Path]:
+    """Index a chapter directory once instead of issuing one stat per utterance."""
+
+    audio_by_id: Dict[str, Path] = {}
+    for suffix in ("*.flac", "*.wav"):
+        for candidate in transcript_path.parent.glob(suffix):
+            audio_by_id[candidate.stem] = candidate
+    return audio_by_id
 
 
 def read_subset(corpus_root: Path, subset: str) -> List[Dict[str, str]]:
@@ -104,8 +109,10 @@ def read_subset(corpus_root: Path, subset: str) -> List[Dict[str, str]]:
     if not subset_root.is_dir():
         raise FileNotFoundError(f"LibriSpeech subset not found: {subset_root}")
 
+    print(f"[info] scanning LibriSpeech subset: {subset_root}", flush=True)
     rows: List[Dict[str, str]] = []
     for transcript_path in sorted(subset_root.rglob("*.trans.txt")):
+        audio_by_id = index_audio_files(transcript_path)
         with transcript_path.open("r", encoding="utf-8") as handle:
             for line_number, line in enumerate(handle, start=1):
                 parts = line.rstrip("\n").split(maxsplit=1)
@@ -114,16 +121,23 @@ def read_subset(corpus_root: Path, subset: str) -> List[Dict[str, str]]:
                         f"Malformed transcript at {transcript_path}:{line_number}: {line!r}"
                     )
                 utterance_id, reference = parts
+                audio_path = audio_by_id.get(utterance_id)
+                if audio_path is None:
+                    raise FileNotFoundError(
+                        f"No .flac or .wav found for {utterance_id} next to "
+                        f"{transcript_path}"
+                    )
                 rows.append(
                     {
                         "text_id": utterance_id,
-                        "audio": str(find_audio(transcript_path, utterance_id)),
+                        "audio": str(audio_path),
                         "reference": reference.strip(),
                         "subset": subset,
                     }
                 )
     if not rows:
         raise RuntimeError(f"No LibriSpeech transcripts found under {subset_root}")
+    print(f"[info] loaded {len(rows)} rows from {subset}", flush=True)
     return rows
 
 
@@ -202,13 +216,39 @@ def unique_in_order(items: Iterable[str]) -> List[str]:
 def sample_without_reference(
     pool: Sequence[str], reference_words: Sequence[str], count: int, rng: random.Random
 ) -> List[str]:
-    excluded = set(reference_words)
-    candidates = [word for word in pool if word not in excluded]
-    if count > len(candidates):
+    """Sample unique words without materializing the full allowed pool per row."""
+
+    if count < 0:
+        raise ValueError("Distractor count must be non-negative")
+    if count > len(pool):
         raise ValueError(
-            f"Requested {count} distractors but only {len(candidates)} candidates are available"
+            f"Requested {count} distractors but the pool contains only {len(pool)} words"
         )
-    return rng.sample(candidates, count)
+
+    excluded = set(reference_words)
+    selected: List[str] = []
+    selected_set = set()
+    max_attempts = max(1000, count * 10)
+    for _ in range(max_attempts):
+        if len(selected) == count:
+            return selected
+        word = pool[rng.randrange(len(pool))]
+        if word not in excluded and word not in selected_set:
+            selected.append(word)
+            selected_set.add(word)
+
+    # This fallback is reached only for unusually small or heavily excluded pools.
+    candidates = [
+        word for word in pool if word not in excluded and word not in selected_set
+    ]
+    remaining = count - len(selected)
+    if remaining > len(candidates):
+        raise ValueError(
+            f"Requested {count} distractors but only "
+            f"{len(selected) + len(candidates)} candidates are available"
+        )
+    selected.extend(rng.sample(candidates, remaining))
+    return selected
 
 
 def mark_reference(reference: str, bias_words: Sequence[str]) -> str:
@@ -266,14 +306,40 @@ def make_sampled_output_row(
     )
 
 
-def write_jsonl(path: Path, rows: Iterable[Dict[str, object]]) -> int:
+def count_jsonl_rows(path: Path) -> int:
+    with path.open("rb") as handle:
+        return sum(1 for _ in handle)
+
+
+def write_jsonl(
+    path: Path,
+    rows: Iterable[Dict[str, object]],
+    expected_count: Optional[int] = None,
+    resume: bool = False,
+) -> int:
     path.parent.mkdir(parents=True, exist_ok=True)
+    if resume and expected_count is not None and path.is_file():
+        existing_count = count_jsonl_rows(path)
+        if existing_count == expected_count:
+            print(
+                f"[skip] complete JSONL already exists ({existing_count} rows): {path}",
+                flush=True,
+            )
+            return existing_count
+        print(
+            f"[info] rewriting incomplete JSONL ({existing_count}/{expected_count} rows): "
+            f"{path}",
+            flush=True,
+        )
+    print(f"[info] writing: {path}", flush=True)
     count = 0
     with path.open("w", encoding="utf-8") as handle:
         for row in rows:
             handle.write(json.dumps(row, ensure_ascii=False) + "\n")
             count += 1
-    print(f"[info] wrote {count} rows: {path}")
+            if count % 10000 == 0:
+                print(f"[info] wrote {count} rows so far: {path}", flush=True)
+    print(f"[info] wrote {count} rows: {path}", flush=True)
     return count
 
 
@@ -346,7 +412,12 @@ def main() -> None:
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
     split_counts: Dict[str, int] = {}
-    split_counts["train"] = write_jsonl(args.output_dir / "train.jsonl", training_items())
+    split_counts["train"] = write_jsonl(
+        args.output_dir / "train.jsonl",
+        training_items(),
+        expected_count=len(train_rows),
+        resume=args.resume,
+    )
 
     def write_generated_evaluation(subset: str) -> None:
         source_rows = read_subset(corpus_root, subset)
@@ -372,6 +443,8 @@ def main() -> None:
                 )
                 for row in source_rows
             ),
+            expected_count=len(source_rows),
+            resume=args.resume,
         )
 
         for bias_list_size in args.eval_bias_sizes:
@@ -395,7 +468,10 @@ def main() -> None:
 
             name = f"{short_name}_n{bias_list_size}"
             split_counts[name] = write_jsonl(
-                args.output_dir / f"{name}.jsonl", evaluation_items()
+                args.output_dir / f"{name}.jsonl",
+                evaluation_items(),
+                expected_count=len(source_rows),
+                resume=args.resume,
             )
 
     def write_official_test_evaluation(subset: str) -> None:
@@ -419,11 +495,6 @@ def main() -> None:
                 if normalize_reward_text(str(benchmark_row["reference"]), False) != \
                         normalize_reward_text(source_by_id[text_id]["reference"], False):
                     raise ValueError(f"Reference mismatch for benchmark utterance {text_id}")
-                if len(benchmark_row["bias_list"]) != bias_list_size:
-                    raise ValueError(
-                        f"Official list for {text_id} has {len(benchmark_row['bias_list'])} "
-                        f"items, expected {bias_list_size}"
-                    )
             official_by_size[bias_list_size] = official_rows
 
         local_rows = official_by_size[min(args.eval_bias_sizes)]
@@ -452,6 +523,8 @@ def main() -> None:
                 )
                 for row in local_rows
             ),
+            expected_count=len(source_rows),
+            resume=args.resume,
         )
 
         for bias_list_size, official_rows in official_by_size.items():
@@ -468,6 +541,8 @@ def main() -> None:
                     )
                     for row in official_rows
                 ),
+                expected_count=len(source_rows),
+                resume=args.resume,
             )
 
     for subset in args.dev_subsets:

@@ -15,7 +15,7 @@ This script fine-tunes **Qwen3-ASR** using JSONL audio-text pairs. It supports m
 |---|---|---|---|
 | `baseline` | Qwen3-ASR base | none | direct speech recognition |
 | `local` | Qwen3-ASR base | only rare words in this reference | positive-only contextual biasing |
-| `global` | Qwen3-ASR base | fixed Rare5k list of size N | contextual biasing with distractors |
+| `global` | Qwen3-ASR base | fixed Rare5k condition N list | contextual biasing with distractors |
 | `rlbr` | RLBR adapter | the same fixed Rare5k list | the proposed method |
 
 `sft` remains available as an optional ablation. The legacy `base` name remains
@@ -69,21 +69,42 @@ uses the row's `prompt`, or constructs the same marked prompt from `bias_list`
 when `prompt` is absent. Every prediction and metric file records the selected
 mode.
 
+The default `--eval_bias_sizes "100 500 1000"` therefore produces three
+`global` conditions and the same three `rlbr` conditions. After Stage 3 finishes,
+the script automatically writes the following consolidated report files:
+
+```text
+exp/rlbr/qwen3_asr_06b/eval/report/summary.md
+exp/rlbr/qwen3_asr_06b/eval/report/summary.csv
+exp/rlbr/qwen3_asr_06b/eval/report/summary.json
+```
+
+The report contains WER, BWER, UWER, and decode failures for every requested
+system and test split. It also reports the absolute change and relative error
+reduction of `rlbr` against `global` at each matching bias condition N.
+
 The prepared JSONL keeps the same record usable by both stages. `prompt`
 contains the marked contextual list, `text` is the marked Qwen3-ASR target,
 `reference` is the unmarked transcript, `bias_words` contains positive terms,
 and `bias_list` contains the actual prompt list. The public Rare5k protocol
 defines the top 5,000 training words as common and the remaining 209.2K words
-as rare. Its fixed test TSVs provide the rare reference words and complete
-lists of exactly 100, 500, or 1,000 words. `local` uses only the former, while
-`global` and `rlbr` use the complete list. Because local positives are selected
-from the reference, `local` is an oracle-style analysis condition rather than a
-deployable retrieval method.
+as rare. Its fixed test TSVs provide the rare reference words and the complete
+lists for conditions N=100, 500, and 1,000. `local` uses only the former, while
+`global` and `rlbr` preserve each released list exactly. Because local positives
+are selected from the reference, `local` is an oracle-style analysis condition
+rather than a deployable retrieval method.
 
-The RLBR paper's prose calls `N` the number of distractors, while the referenced
-public benchmark defines `N` as the complete biasing-list size and releases TSV
-rows with exactly `N` entries. This implementation follows the released TSVs so
-the evaluation data are directly comparable to that benchmark.
+The RLBR paper describes `N` as the distractor condition, while the public
+benchmark README calls it the biasing-list size. The released TSV contents are
+the authority for evaluation: positive reference words are guaranteed to be in
+the list, and the resulting list length can differ slightly from `N` after list
+construction and deduplication. Therefore `bias_list_size` and
+`distractor_count` record the actual per-utterance values instead of assuming
+that every row has exactly `N` entries.
+
+If Stage 0 is interrupted after some JSONLs finish, rerun it with `--resume 1`.
+Completed files are reused only when their row count matches the source split;
+an incomplete file is rewritten.
 
 If `--biasing_benchmark_root` is omitted, the script deterministically
 reconstructs equivalent lists from the available LibriSpeech transcripts and
