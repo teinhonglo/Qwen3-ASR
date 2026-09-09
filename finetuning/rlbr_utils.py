@@ -13,10 +13,13 @@ formatting error (Fig. 1).
 
 from __future__ import annotations
 
+import csv
+import json
 import re
 import unicodedata
 from dataclasses import dataclass
-from typing import Any, Dict, Iterable, List, Sequence, Tuple
+from pathlib import Path
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 
 _QWEN_ASR_PREFIX_RE = re.compile(
@@ -312,4 +315,195 @@ def compute_corpus_error_rates(rows: Iterable[Dict[str, Any]]) -> Dict[str, Any]
         "wer": rate(total_errors, counts["reference_words"]),
         "bwer": rate(counts["bias_errors"], counts["bias_reference_words"]),
         "uwer": rate(counts["unbiased_errors"], counts["unbiased_reference_words"]),
+    }
+
+
+def _evaluation_bias_sizes(model_name: str, bias_sizes: Sequence[int]) -> List[Optional[int]]:
+    if model_name in {"baseline", "local"}:
+        return [None]
+    if model_name in {"global", "base", "sft", "rlbr"}:
+        return list(bias_sizes)
+    raise ValueError(f"Unsupported report model: {model_name}")
+
+
+def _relative_reduction(baseline: float, value: float) -> Optional[float]:
+    if baseline == 0.0:
+        return None
+    return 100.0 * (baseline - value) / baseline
+
+
+def collect_evaluation_report(
+    eval_root: Path,
+    model_names: Sequence[str],
+    bias_sizes: Sequence[int],
+    splits: Sequence[str] = ("test_clean", "test_other"),
+) -> Dict[str, Any]:
+    """Collect Stage 3 metrics and compare RLBR against global at each N."""
+
+    eval_root = Path(eval_root)
+    results: List[Dict[str, Any]] = []
+    missing: List[str] = []
+    for split in splits:
+        for model_name in model_names:
+            for bias_size in _evaluation_bias_sizes(model_name, bias_sizes):
+                condition = model_name if bias_size is None else f"{model_name}-{bias_size}"
+                result_dir = split if bias_size is None else f"{split}_n{bias_size}"
+                metrics_path = eval_root / model_name / result_dir / "metrics.json"
+                if not metrics_path.is_file():
+                    missing.append(str(metrics_path))
+                    continue
+                with metrics_path.open("r", encoding="utf-8") as handle:
+                    metrics = json.load(handle)
+                results.append(
+                    {
+                        "split": split,
+                        "system": model_name,
+                        "condition": condition,
+                        "bias_size_n": bias_size,
+                        "wer": float(metrics["wer"]),
+                        "bwer": float(metrics["bwer"]),
+                        "uwer": float(metrics["uwer"]),
+                        "utterances": int(metrics["utterances"]),
+                        "decode_failures": int(metrics.get("decode_failures", 0)),
+                        "decode_failure_rate": float(
+                            metrics.get("decode_failure_rate", 0.0)
+                        ),
+                        "metrics_path": str(metrics_path),
+                    }
+                )
+
+    if missing:
+        raise FileNotFoundError(
+            "Cannot create a complete evaluation report; missing metrics:\n"
+            + "\n".join(missing)
+        )
+
+    by_key = {
+        (row["system"], row["split"], row["bias_size_n"]): row for row in results
+    }
+    comparisons: List[Dict[str, Any]] = []
+    if "global" in model_names and "rlbr" in model_names:
+        for split in splits:
+            for bias_size in bias_sizes:
+                global_row = by_key[("global", split, bias_size)]
+                rlbr_row = by_key[("rlbr", split, bias_size)]
+                comparison: Dict[str, Any] = {
+                    "split": split,
+                    "bias_size_n": bias_size,
+                }
+                for metric in ("wer", "bwer", "uwer"):
+                    global_value = float(global_row[metric])
+                    rlbr_value = float(rlbr_row[metric])
+                    comparison[f"global_{metric}"] = global_value
+                    comparison[f"rlbr_{metric}"] = rlbr_value
+                    comparison[f"{metric}_absolute_change"] = (
+                        rlbr_value - global_value
+                    )
+                    comparison[f"{metric}_relative_reduction"] = _relative_reduction(
+                        global_value, rlbr_value
+                    )
+                comparisons.append(comparison)
+
+    return {
+        "eval_root": str(eval_root),
+        "models": list(model_names),
+        "bias_sizes": list(bias_sizes),
+        "splits": list(splits),
+        "results": results,
+        "rlbr_vs_global": comparisons,
+    }
+
+
+def _format_report_number(value: Optional[float]) -> str:
+    return "N/A" if value is None else f"{value:.3f}"
+
+
+def write_evaluation_report(
+    eval_root: Path,
+    output_dir: Path,
+    model_names: Sequence[str],
+    bias_sizes: Sequence[int],
+    splits: Sequence[str] = ("test_clean", "test_other"),
+) -> Dict[str, str]:
+    """Write machine-readable and Markdown summaries for Stage 3 evaluation."""
+
+    report = collect_evaluation_report(eval_root, model_names, bias_sizes, splits)
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    json_path = output_dir / "summary.json"
+    with json_path.open("w", encoding="utf-8") as handle:
+        json.dump(report, handle, ensure_ascii=False, indent=2)
+
+    csv_path = output_dir / "summary.csv"
+    result_fields = [
+        "split",
+        "system",
+        "condition",
+        "bias_size_n",
+        "wer",
+        "bwer",
+        "uwer",
+        "utterances",
+        "decode_failures",
+        "decode_failure_rate",
+        "metrics_path",
+    ]
+    with csv_path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=result_fields)
+        writer.writeheader()
+        writer.writerows(report["results"])
+
+    markdown_path = output_dir / "summary.md"
+    lines = [
+        "# RLBR Evaluation Report",
+        "",
+        "## Results",
+        "",
+        "| Split | System | Bias condition | WER (%) | BWER (%) | UWER (%) | Decode failures |",
+        "|---|---|---:|---:|---:|---:|---:|",
+    ]
+    for row in report["results"]:
+        condition = "none" if row["system"] == "baseline" else (
+            "local" if row["bias_size_n"] is None else f"N={row['bias_size_n']}"
+        )
+        lines.append(
+            f"| {row['split']} | {row['system']} | {condition} | "
+            f"{row['wer']:.3f} | {row['bwer']:.3f} | {row['uwer']:.3f} | "
+            f"{row['decode_failures']} |"
+        )
+
+    lines.extend(
+        [
+            "",
+            "## RLBR vs. Global",
+            "",
+            "Absolute change is RLBR minus Global, so a negative value is better. "
+            "Relative reduction is positive when RLBR reduces the error rate.",
+            "",
+            "| Split | N | WER change | WER reduction (%) | BWER change | "
+            "BWER reduction (%) | UWER change | UWER reduction (%) |",
+            "|---|---:|---:|---:|---:|---:|---:|---:|",
+        ]
+    )
+    if report["rlbr_vs_global"]:
+        for row in report["rlbr_vs_global"]:
+            lines.append(
+                f"| {row['split']} | {row['bias_size_n']} | "
+                f"{row['wer_absolute_change']:.3f} | "
+                f"{_format_report_number(row['wer_relative_reduction'])} | "
+                f"{row['bwer_absolute_change']:.3f} | "
+                f"{_format_report_number(row['bwer_relative_reduction'])} | "
+                f"{row['uwer_absolute_change']:.3f} | "
+                f"{_format_report_number(row['uwer_relative_reduction'])} |"
+            )
+    else:
+        lines.append("| N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |")
+    lines.append("")
+    markdown_path.write_text("\n".join(lines), encoding="utf-8")
+
+    return {
+        "markdown": str(markdown_path),
+        "csv": str(csv_path),
+        "json": str(json_path),
     }

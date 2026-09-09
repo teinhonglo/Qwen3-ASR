@@ -8,15 +8,18 @@ import json
 import os
 from typing import Any, Dict, List
 
-from qwen3_asr_test import infer_one, load_asr_wrapper, resolve_dtype
-from rlbr_utils import compute_corpus_error_rates, resolve_evaluation_prompt
+from rlbr_utils import (
+    compute_corpus_error_rates,
+    resolve_evaluation_prompt,
+    write_evaluation_report,
+)
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser("Evaluate contextual Qwen3-ASR checkpoints")
-    parser.add_argument("--model_path", type=str, required=True)
-    parser.add_argument("--input_jsonl", type=str, required=True)
-    parser.add_argument("--output_dir", type=str, required=True)
+    parser.add_argument("--model_path", type=str, default="")
+    parser.add_argument("--input_jsonl", type=str, default="")
+    parser.add_argument("--output_dir", type=str, default="")
     parser.add_argument("--device", type=str, default="cuda:0")
     parser.add_argument(
         "--dtype",
@@ -40,7 +43,35 @@ def parse_args() -> argparse.Namespace:
             "uses `prompt` or builds one from `bias_list`"
         ),
     )
-    return parser.parse_args()
+    parser.add_argument(
+        "--report_eval_root",
+        type=str,
+        default="",
+        help="Collect completed Stage 3 metrics below this directory and exit.",
+    )
+    parser.add_argument("--report_output_dir", type=str, default="")
+    parser.add_argument(
+        "--report_models",
+        nargs="+",
+        default=["baseline", "local", "global", "rlbr"],
+    )
+    parser.add_argument(
+        "--report_bias_sizes", nargs="+", type=int, default=[100, 500, 1000]
+    )
+    args = parser.parse_args()
+    if not args.report_eval_root:
+        missing = [
+            option
+            for option, value in (
+                ("--model_path", args.model_path),
+                ("--input_jsonl", args.input_jsonl),
+                ("--output_dir", args.output_dir),
+            )
+            if not value
+        ]
+        if missing:
+            parser.error("decode mode requires " + ", ".join(missing))
+    return args
 
 
 def load_jsonl(path: str) -> List[Dict[str, Any]]:
@@ -58,6 +89,21 @@ def load_jsonl(path: str) -> List[Dict[str, Any]]:
 
 def main() -> None:
     args = parse_args()
+    if args.report_eval_root:
+        report_output_dir = args.report_output_dir or os.path.join(
+            args.report_eval_root, "report"
+        )
+        paths = write_evaluation_report(
+            eval_root=args.report_eval_root,
+            output_dir=report_output_dir,
+            model_names=args.report_models,
+            bias_sizes=args.report_bias_sizes,
+        )
+        print(json.dumps(paths, ensure_ascii=False, indent=2))
+        return
+
+    from qwen3_asr_test import infer_one, load_asr_wrapper, resolve_dtype
+
     os.makedirs(args.output_dir, exist_ok=True)
     dtype = resolve_dtype(args.dtype, args.device)
     wrapper = load_asr_wrapper(args.model_path, dtype=dtype, device=args.device)

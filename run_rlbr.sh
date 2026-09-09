@@ -103,6 +103,9 @@ if [ $stage -le 0 ] && [ $stop_stage -ge 0 ]; then
         if [ -n "$biasing_benchmark_root" ]; then
             benchmark_args+=(--biasing_benchmark_root "$biasing_benchmark_root")
         fi
+        if [ "$resume" -eq 1 ]; then
+            benchmark_args+=(--resume)
+        fi
         python local/prepare_rlbr_librispeech.py \
             --librispeech_root "$librispeech_root" \
             --output_dir "$data_dir" \
@@ -221,4 +224,10 @@ if [ $stage -le 3 ] && [ $stop_stage -ge 3 ]; then
             done
         done
     done
+
+    python finetuning/qwen3_asr_rlbr_test.py \
+        --report_eval_root "$exp_root/eval" \
+        --report_output_dir "$exp_root/eval/report" \
+        --report_models $eval_models \
+        --report_bias_sizes $eval_bias_sizes
 fi
