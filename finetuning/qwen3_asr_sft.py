@@ -30,6 +30,20 @@ from transformers import (GenerationConfig, Trainer, TrainerCallback,
                           TrainingArguments)
 
 
+DEFAULT_LORA_TARGET_MODULES = [
+    "q_proj",
+    "k_proj",
+    "v_proj",
+    "o_proj",
+    "out_proj",
+    "gate_proj",
+    "up_proj",
+    "down_proj",
+    "fc1",
+    "fc2",
+]
+
+
 def patch_outer_forward(model):
     cls = model.__class__
     if getattr(cls, "_forward_patched", False):
@@ -61,6 +75,43 @@ def patch_outer_forward(model):
 
     cls.forward = forward
     cls._forward_patched = True
+
+
+def maybe_apply_lora(model, model_args_conf: Dict[str, Any]):
+    """Apply paper-style LoRA while preserving legacy full fine-tuning."""
+
+    finetune_type = str(model_args_conf.get("finetune_type", "full")).lower()
+    if finetune_type == "full":
+        return model
+    if finetune_type != "lora":
+        raise ValueError("model_args.finetune_type must be 'full' or 'lora'")
+
+    try:
+        from peft import LoraConfig, TaskType, get_peft_model
+    except ImportError as exc:
+        raise ImportError(
+            "LoRA fine-tuning requires PEFT. Install with `pip install -U peft`."
+        ) from exc
+
+    rank = int(model_args_conf.get("lora_rank", 320))
+    alpha = int(model_args_conf.get("lora_alpha", rank))
+    target_modules = model_args_conf.get(
+        "lora_target_modules", DEFAULT_LORA_TARGET_MODULES
+    )
+    if not isinstance(target_modules, list) or not target_modules:
+        raise ValueError("model_args.lora_target_modules must be a non-empty list")
+
+    peft_config = LoraConfig(
+        task_type=TaskType.CAUSAL_LM,
+        r=rank,
+        lora_alpha=alpha,
+        lora_dropout=float(model_args_conf.get("lora_dropout", 0.0)),
+        target_modules=target_modules,
+        bias="none",
+    )
+    model = get_peft_model(model, peft_config)
+    model.print_trainable_parameters()
+    return model
 
 
 _CKPT_RE = re.compile(r"^checkpoint-(\d+)$")
@@ -145,7 +196,11 @@ class DataCollatorForQwen3ASRFinetuning:
         prefix_lens = prefix_inputs["attention_mask"].sum(dim=1).tolist()
         labels = full_inputs["input_ids"].clone()
         for i, pl in enumerate(prefix_lens):
-            labels[i, :pl] = -100
+            nonz_idx = torch.nonzero(
+                full_inputs["attention_mask"][i],
+                as_tuple=False,
+            )[0].item()
+            labels[i, nonz_idx:nonz_idx + int(pl)] = -100
 
         pad_id = self.processor.tokenizer.pad_token_id
         if pad_id is not None:
@@ -289,12 +344,13 @@ def main():
     model = asr_wrapper.model
     processor = asr_wrapper.processor
 
-    if training_args_conf["gradient_checkpointing"]:
+    if training_args_conf.get("gradient_checkpointing", False):
         model.config.use_cache = False
         model.gradient_checkpointing_enable()
 
     patch_outer_forward(model)
     model.generation_config = GenerationConfig.from_model_config(model.config)
+    model = maybe_apply_lora(model, model_args_conf)
 
     raw_ds = load_dataset(
         "json",
@@ -369,6 +425,14 @@ def main():
         trainer.train(resume_from_checkpoint=resume_from)
     else:
         trainer.train()
+
+    # Keep the experiment root directly inferable instead of requiring callers
+    # to discover the final checkpoint directory.  For LoRA this saves only the
+    # adapter, while legacy full fine-tuning still saves the full model.
+    trainer.save_model(training_args.output_dir)
+    if trainer.args.process_index == 0:
+        processor.save_pretrained(training_args.output_dir)
+        save_prompt_txt(training_args.output_dir, default_prompt)
 
 
 if __name__ == "__main__":

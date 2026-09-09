@@ -10,6 +10,7 @@ from typing import Any, Dict, List, Optional
 import librosa
 import torch
 from qwen_asr import Qwen3ASRModel
+from transformers import AutoProcessor
 
 
 _CKPT_RE = re.compile(r"^checkpoint-(\d+)$")
@@ -242,6 +243,47 @@ def resolve_dtype(dtype_str: str, device: str) -> torch.dtype:
     return torch.float32
 
 
+def load_asr_wrapper(model_path: str, dtype: torch.dtype, device: str):
+    """Load either a full Qwen3-ASR checkpoint or a PEFT adapter."""
+
+    adapter_config = os.path.join(model_path, "adapter_config.json")
+    if not os.path.isfile(adapter_config):
+        return Qwen3ASRModel.from_pretrained(
+            model_path,
+            dtype=dtype,
+            device_map=device,
+        )
+
+    try:
+        from peft import PeftConfig, PeftModel
+    except ImportError as exc:
+        raise ImportError(
+            "Loading this LoRA checkpoint requires PEFT. Install with `pip install -U peft`."
+        ) from exc
+
+    peft_config = PeftConfig.from_pretrained(model_path)
+    base_model_path = peft_config.base_model_name_or_path
+    wrapper = Qwen3ASRModel.from_pretrained(
+        base_model_path,
+        dtype=dtype,
+        device_map=device,
+    )
+    wrapper.model = PeftModel.from_pretrained(
+        wrapper.model,
+        model_path,
+        is_trainable=False,
+    )
+    # SFT/RLBR save the processor beside the adapter.  Falling back to the
+    # base processor remains safe for older adapter checkpoints.
+    try:
+        wrapper.processor = AutoProcessor.from_pretrained(
+            model_path, fix_mistral_regex=True
+        )
+    except (OSError, ValueError):
+        pass
+    return wrapper
+
+
 def get_jsonl_name(input_jsonl: str) -> str:
     base = os.path.basename(input_jsonl)
     name, _ = os.path.splitext(base)
@@ -329,10 +371,10 @@ def main():
     dtype = resolve_dtype(dtype_str, args.device)
     jsonl_name = get_jsonl_name(args.input_jsonl)
 
-    asr_wrapper = Qwen3ASRModel.from_pretrained(
-        model_path,
+    asr_wrapper = load_asr_wrapper(
+        model_path=model_path,
         dtype=dtype,
-        device_map=args.device,
+        device=args.device,
     )
 
     rows = load_jsonl(args.input_jsonl)
