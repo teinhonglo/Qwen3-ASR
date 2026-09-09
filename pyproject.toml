@@ -37,6 +37,10 @@ dependencies = [
 vllm = [
   "vllm==0.14.0",
 ]
+rlbr = [
+  "datasets>=3.0.0",
+  "peft>=0.17.0",
+]
 
 [project.urls]
 Homepage = "https://github.com/Qwen/Qwen3-ASR"

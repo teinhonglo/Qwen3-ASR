@@ -2,6 +2,119 @@
 
 This script fine-tunes **Qwen3-ASR** using JSONL audio-text pairs. It supports multi-GPU training via `torchrun`.
 
+## RLBR reproduction with Qwen3-ASR
+
+`run_rlbr.sh` reproduces the method in [**RLBR: Reinforcement Learning with Biasing Rewards for Contextual Speech Large Language Models**](https://arxiv.org/abs/2601.13409) (Ren et al., ICASSP 2026) with Qwen3-ASR-0.6B as the backbone. It runs four stages:
+
+1. Construct contextual LibriSpeech data.
+2. Train the contextual supervised fine-tuning (SFT) seed.
+3. Continue the SFT adapter with reference-aware Group Relative Policy Optimization (GRPO) and the RLBR reward.
+4. Decode four explicit systems and report WER, BWER, UWER, and the decode-failure rate.
+
+| Evaluation system | Checkpoint | Prompt | Purpose |
+|---|---|---|---|
+| `baseline` | Qwen3-ASR base | none | direct speech recognition |
+| `local` | Qwen3-ASR base | only rare words in this reference | positive-only contextual biasing |
+| `global` | Qwen3-ASR base | fixed Rare5k list of size N | contextual biasing with distractors |
+| `rlbr` | RLBR adapter | the same fixed Rare5k list | the proposed method |
+
+`sft` remains available as an optional ablation. The legacy `base` name remains
+an alias for the base-model global-biasing behavior; use `baseline` when the
+model must not see any biasing words.
+
+Assuming `qwen-asr` is already installed, install the additional dependencies with:
+
+```bash
+pip install -U datasets peft
+```
+
+LibriSpeech itself does not ship contextual lists. For the paper-compatible
+test conditions, clone the public Rare5k benchmark files released for the
+protocol followed by RLBR:
+
+```bash
+git clone --depth 1 https://github.com/facebookresearch/fbai-speech.git /path/to/fbai-speech
+```
+
+Run the complete experiment from an existing official LibriSpeech directory:
+
+```bash
+./run_rlbr.sh \
+  --librispeech_root /path/to/LibriSpeech \
+  --biasing_benchmark_root /path/to/fbai-speech/is21_deep_bias \
+  --gpuid 0,1,2,3,4,5,6,7
+```
+
+The script follows the repository's `stage`/`stop_stage` convention and skips completed artifacts. For example, to resume only RLBR training:
+
+```bash
+./run_rlbr.sh --stage 2 --stop_stage 2 --gpuid 0,1 --resume 1
+```
+
+To run only the four-way comparison after training:
+
+```bash
+./run_rlbr.sh \
+  --stage 3 \
+  --stop_stage 3 \
+  --eval_models "baseline local global rlbr" \
+  --gpuid 0
+```
+
+`baseline` and `local` are each decoded once per test split. `global` and
+`rlbr` are decoded at each `--eval_bias_sizes` value using identical JSONL rows
+and bias lists. The evaluator's
+`--prompt_mode none` always discards the row prompt; `--prompt_mode biasing`
+uses the row's `prompt`, or constructs the same marked prompt from `bias_list`
+when `prompt` is absent. Every prediction and metric file records the selected
+mode.
+
+The prepared JSONL keeps the same record usable by both stages. `prompt`
+contains the marked contextual list, `text` is the marked Qwen3-ASR target,
+`reference` is the unmarked transcript, `bias_words` contains positive terms,
+and `bias_list` contains the actual prompt list. The public Rare5k protocol
+defines the top 5,000 training words as common and the remaining 209.2K words
+as rare. Its fixed test TSVs provide the rare reference words and complete
+lists of exactly 100, 500, or 1,000 words. `local` uses only the former, while
+`global` and `rlbr` use the complete list. Because local positives are selected
+from the reference, `local` is an oracle-style analysis condition rather than a
+deployable retrieval method.
+
+The RLBR paper's prose calls `N` the number of distractors, while the referenced
+public benchmark defines `N` as the complete biasing-list size and releases TSV
+rows with exactly `N` entries. This implementation follows the released TSVs so
+the evaluation data are directly comparable to that benchmark.
+
+If `--biasing_benchmark_root` is omitted, the script deterministically
+reconstructs equivalent lists from the available LibriSpeech transcripts and
+records `biasing_list_source: generated` in `manifest.json`. Those generated
+lists are useful for development but are not the fixed public benchmark lists.
+
+The following paper-reported settings are preserved in the supplied configs:
+
+- contextual SFT before RLBR
+- LoRA rank 320 on attention and feed-forward projections
+- cosine learning-rate schedule with peak rates `1e-5` for SFT and `5e-6` for RLBR
+- eight categorical samples per input at temperature 1.2
+- character-level edit distance
+- biasing weight `lambda = 5`
+- marked bias words in prompts, targets, and reward computation
+- reference transcription appended as the ninth trajectory for group reward normalization and policy optimization
+- GRPO clipping `epsilon = 0.28` and KL weight `beta = 0`
+
+Several values required by executable code are not reported in the five-page paper. They remain explicit rather than being presented as paper settings: training positive-word count and distractor distribution in `run_rlbr.sh`, and epoch count, batch accumulation, warmup, LoRA alpha/dropout, and maximum completion length in the two `conf/rlbr_*.json` files. The supplied values are starting points for a controlled reproduction and should be reported as implementation choices.
+
+The trainer can keep a frozen copy of the contextual-SFT LoRA adapter without
+loading a second Qwen3-ASR backbone when a nonzero KL weight is requested. The
+paper-compatible default uses `beta = 0`, so no reference-policy adapter is
+needed. The gold reference trajectory receives reward zero and participates in
+both group mean/standard-deviation calculation and policy loss, matching the
+paper's reference-aware formulation. The current implementation performs one
+on-policy update for each sampled group. The paper does not report repeated
+PPO/GRPO inner iterations.
+
+With the default layout, outputs are written below `exp/rlbr/qwen3_asr_06b/`. Each evaluation condition contains `predictions.jsonl` and `metrics.json`.
+
 ### 1) Setup
 
 First, please install the two Python packages `qwen-asr` and `datasets` using the command below.

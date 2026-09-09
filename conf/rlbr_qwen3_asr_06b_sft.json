@@ -1,0 +1,51 @@
+[
+    {
+        "per_device_train_batch_size": 1,
+        "per_device_eval_batch_size": 1,
+        "gradient_accumulation_steps": 16,
+        "learning_rate": 1e-5,
+        "num_train_epochs": 1,
+        "warmup_ratio": 0.02,
+        "save_strategy": "steps",
+        "save_steps": 1000,
+        "eval_strategy": "steps",
+        "eval_steps": 1000,
+        "save_total_limit": 3,
+        "logging_steps": 10,
+        "dataloader_num_workers": 2,
+        "dataloader_pin_memory": true,
+        "dataloader_persistent_workers": true,
+        "dataloader_prefetch_factor": 2,
+        "lr_scheduler_type": "cosine",
+        "save_safetensors": true,
+        "ddp_find_unused_parameters": false,
+        "remove_unused_columns": false,
+        "gradient_checkpointing": true,
+        "report_to": "none"
+    },
+    {
+        "model_path": "Qwen/Qwen3-ASR-0.6B",
+        "dtype": "auto",
+        "sr": 16000,
+        "max_new_tokens": 256,
+        "do_sample": false,
+        "temperature": 1.0,
+        "top_p": 1.0,
+        "finetune_type": "lora",
+        "lora_rank": 320,
+        "lora_alpha": 320,
+        "lora_dropout": 0.0,
+        "lora_target_modules": [
+            "q_proj",
+            "k_proj",
+            "v_proj",
+            "o_proj",
+            "out_proj",
+            "gate_proj",
+            "up_proj",
+            "down_proj",
+            "fc1",
+            "fc2"
+        ]
+    }
+]
