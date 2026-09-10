@@ -344,13 +344,16 @@ def main():
     model = asr_wrapper.model
     processor = asr_wrapper.processor
 
-    if training_args_conf.get("gradient_checkpointing", False):
-        model.config.use_cache = False
-        model.gradient_checkpointing_enable()
-
     patch_outer_forward(model)
     model.generation_config = GenerationConfig.from_model_config(model.config)
     model = maybe_apply_lora(model, model_args_conf)
+
+    # Match the working Qwen3-SLU initialization order.  If checkpointing is
+    # enabled before get_peft_model(), PEFT asks the outer Qwen3-ASR model for
+    # get_input_embeddings(), which that wrapper does not implement.
+    if training_args_conf.get("gradient_checkpointing", False):
+        model.config.use_cache = False
+        model.gradient_checkpointing_enable()
 
     raw_ds = load_dataset(
         "json",
